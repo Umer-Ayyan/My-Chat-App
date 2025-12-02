@@ -1,0 +1,5 @@
+{
+  "name": "Supabase Realtime Chat",
+  "description": "A production-lean real-time messaging application using Supabase (Auth, Postgres, Realtime, Storage) and React. Features include secure 1:1 conversations, file attachments, and presence indicators.",
+  "requestFramePermissions": []
+}
