@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Send, Paperclip, MoreVertical, ArrowLeft, Download, File, Loader2 } from 'lucide-react';
 import { supabase } from '../services/supabaseClient';
 import { Message, Attachment, UserPresence } from '../types';
@@ -25,6 +25,9 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const typingTimeoutRef = useRef<any>(null);
 
+  // Keep a ref to the active channel so we can reuse it for broadcasts / presence tracking
+  const channelRef = useRef<any>(null);
+
   // Auto-scroll to bottom
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -34,16 +37,28 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     scrollToBottom();
   }, [messages, typingUsers]);
 
+  // Helper: dedupe messages by id
+  const addMessageIfNew = useCallback((msg: Message) => {
+    setMessages((prev) => {
+      if (prev.some((m) => m.id === msg.id)) return prev;
+      const merged = [...prev, msg].sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+      return merged;
+    });
+  }, []);
+
   // Fetch initial messages and setup Realtime
   useEffect(() => {
+    if (!conversationId) return;
+
     setLoading(true);
     setMessages([]);
     setPresenceState({});
-    
+    setTypingUsers([]);
+
     // 1. Fetch Messages
     const fetchMessages = async () => {
       const { data, error } = await supabase
-        .from('messages')
+        .from<Message>('messages')
         .select('*')
         .eq('conversation_id', conversationId)
         .order('created_at', { ascending: true });
@@ -59,7 +74,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
 
     fetchMessages();
 
-    // 2. Setup Realtime Channel
+    // 2. Setup Realtime Channel and store in ref
     const channel = supabase.channel(`conversation:${conversationId}`);
 
     channel
@@ -74,66 +89,101 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
         },
         (payload) => {
           const newMsg = payload.new as Message;
-          setMessages((prev) => [...prev, newMsg]);
+          addMessageIfNew(newMsg);
         }
       )
-      // Listen for Presence
+      // Presence sync handler
       .on('presence', { event: 'sync' }, () => {
-        const newState = channel.presenceState();
-        // flatten presence state
-        const users: Record<string, UserPresence> = {};
-        for (const key in newState) {
+        try {
+          const newState = channel.presenceState();
+          const users: Record<string, UserPresence> = {};
+          for (const key in newState) {
             const presences = newState[key] as any[];
             if (presences.length > 0) {
-                users[key] = presences[0];
+              users[key] = presences[0];
             }
+          }
+          setPresenceState(users);
+        } catch (err) {
+          // If presenceState isn't supported in your SDK version, ignore
+          console.warn('presence sync error', err);
         }
-        setPresenceState(users);
       })
-      // Listen for Typing Broadcasts
+      // Typing broadcasts
       .on('broadcast', { event: 'typing' }, (payload) => {
-        const { user_id, isTyping } = payload.payload;
-        if (user_id === currentUserId) return;
+        const { user_id, isTyping } = payload.payload ?? payload;
+        if (!user_id || user_id === currentUserId) return;
 
         setTypingUsers((prev) => {
-          const others = prev.filter(id => id !== user_id);
+          const others = prev.filter((id) => id !== user_id);
           return isTyping ? [...others, user_id] : others;
         });
       })
+      // Subscribe and then track presence if subscribed
       .subscribe(async (status) => {
+        // store reference to the subscribed channel so other handlers can use it
+        channelRef.current = channel;
+
         if (status === 'SUBSCRIBED') {
-          await channel.track({
-            user_id: currentUserId,
-            online_at: new Date().toISOString(),
-          });
+          try {
+            await channel.track({
+              user_id: currentUserId,
+              online_at: new Date().toISOString(),
+            });
+          } catch (err) {
+            console.warn('presence track failed', err);
+          }
         }
       });
 
+    // cleanup
     return () => {
+      try {
+        // untrack presence if available
+        channelRef.current?.untrack?.({ user_id: currentUserId }).catch?.(() => {});
+      } catch (e) {}
       supabase.removeChannel(channel);
+      channelRef.current = null;
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+      }
     };
-  }, [conversationId, currentUserId]);
+  }, [conversationId, currentUserId, addMessageIfNew]);
 
-  // Handle Typing Indicator broadcast
+  // Handle Typing Indicator broadcast - use the subscribed channel from ref
   const handleTyping = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setNewMessage(e.target.value);
+    const text = e.target.value;
+    setNewMessage(text);
+
+    const channel = channelRef.current;
+    if (!channel) {
+      // channel not ready yet — not fatal
+      return;
+    }
 
     // Broadcast typing true
-    const channel = supabase.channel(`conversation:${conversationId}`);
-    channel.send({
-      type: 'broadcast',
-      event: 'typing',
-      payload: { user_id: currentUserId, isTyping: true },
-    });
+    try {
+      channel.send({
+        type: 'broadcast',
+        event: 'typing',
+        payload: { user_id: currentUserId, isTyping: true },
+      });
+    } catch (err) {
+      console.warn('typing broadcast failed', err);
+    }
 
     // Debounce typing false
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
     typingTimeoutRef.current = setTimeout(() => {
-      channel.send({
-        type: 'broadcast',
-        event: 'typing',
-        payload: { user_id: currentUserId, isTyping: false },
-      });
+      try {
+        channel.send({
+          type: 'broadcast',
+          event: 'typing',
+          payload: { user_id: currentUserId, isTyping: false },
+        });
+      } catch (err) {
+        console.warn('typing broadcast failed', err);
+      }
     }, 2000);
   };
 
@@ -148,15 +198,21 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
       const fileName = `${Math.random().toString(36).substring(2)}.${fileExt}`;
       const filePath = `${conversationId}/${fileName}`;
 
+      // NOTE: confirm your bucket name here. I use 'chat-attachments' as recommended earlier.
+      const BUCKET = 'chat-attachments';
+
       const { error: uploadError } = await supabase.storage
-        .from('attachments')
+        .from(BUCKET)
         .upload(filePath, file);
 
       if (uploadError) throw uploadError;
 
-      const { data: { publicUrl } } = supabase.storage
-        .from('attachments')
+      const { data } = supabase.storage
+        .from(BUCKET)
         .getPublicUrl(filePath);
+
+      // data.publicUrl or data.publicURL depending on SDK; guard both
+      const publicUrl = (data as any)?.publicUrl ?? (data as any)?.publicURL ?? '';
 
       const attachment: Attachment = {
         name: file.name,
@@ -167,7 +223,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
 
       await sendMessage(undefined, [attachment]);
     } catch (err: any) {
-      alert(`Upload failed: ${err.message}`);
+      alert(`Upload failed: ${err.message ?? String(err)}`);
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -176,20 +232,26 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
 
   const sendMessage = async (text?: string, attachments: Attachment[] = []) => {
     const content = text !== undefined ? text : newMessage;
-    if ((!content.trim() && attachments.length === 0) || sending) return;
+    if ((!(content && content.trim()) && attachments.length === 0) || sending || !conversationId) return;
 
     setSending(true);
-    // Optimistic update could happen here, but Realtime is fast enough for MVP
-    
+
     try {
-      const { error } = await supabase.from('messages').insert({
-        conversation_id: conversationId,
-        sender_id: currentUserId,
-        content: content,
-        attachments: attachments.length > 0 ? attachments : null,
-      });
+      // Insert to DB (this will trigger Postgres changefeed and deliver to subscribers)
+      const { data, error } = await supabase
+        .from('messages')
+        .insert({
+          conversation_id: conversationId,
+          sender_id: currentUserId,
+          content: content && content.trim() ? content.trim() : null,
+          attachments: attachments.length > 0 ? attachments : null,
+        })
+        .select()
+        .single();
 
       if (error) throw error;
+
+      // The realtime listener will pick this up and add the message (dedupe prevents duplicates)
       setNewMessage('');
     } catch (err) {
       console.error('Failed to send', err);
@@ -244,7 +306,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                     <div className="mb-2 space-y-2">
                       {msg.attachments.map((att, idx) => (
                         <div key={idx}>
-                          {att.type.startsWith('image/') ? (
+                          {att.type?.startsWith('image/') ? (
                              <img src={att.url} alt="attachment" className="rounded-lg max-h-48 object-cover border border-white/20" />
                           ) : (
                              <a href={att.url} target="_blank" rel="noopener noreferrer" className={`flex items-center gap-2 p-2 rounded ${isMe ? 'bg-blue-700' : 'bg-gray-100'} hover:opacity-90 transition`}>
@@ -290,8 +352,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
             ref={fileInputRef}
             onChange={handleFileUpload}
             className="hidden"
-            // Accept images and basic docs
-            accept="image/*,application/pdf,.doc,.docx" 
+            accept="image/*,application/pdf,.doc,.docx"
           />
           <button
             type="button"
@@ -301,7 +362,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
           >
             {uploading ? <Loader2 size={20} className="animate-spin" /> : <Paperclip size={20} />}
           </button>
-          
+
           <div className="flex-1 bg-gray-100 rounded-2xl flex items-center px-4 py-2 focus-within:ring-2 focus-within:ring-blue-500/20 focus-within:bg-white transition-all border border-transparent focus-within:border-blue-500">
             <input
               type="text"
@@ -316,7 +377,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
           <button
             type="submit"
             disabled={(!newMessage.trim() && !uploading) || sending}
-            className="p-3 bg-blue-600 text-white rounded-full hover:bg-blue-700 shadow-md hover:shadow-lg disabled:opacity-50 disabled:shadow-none transition-all"
+            className="p-3 bg-blue-600 text-white px-4 py-2 rounded-full hover:bg-blue-700 shadow-md hover:shadow-lg disabled:opacity-50 disabled:shadow-none transition-all"
           >
             <Send size={20} />
           </button>

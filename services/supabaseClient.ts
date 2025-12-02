@@ -1,17 +1,20 @@
+// src/services/supabaseClient.ts
 import { createClient } from '@supabase/supabase-js';
 
-// NOTE: In a real production app, these should be in .env files.
-// For this environment, we expect them to be available via process.env or hardcoded by the user.
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+const url = import.meta.env.VITE_SUPABASE_URL;
+const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
-if (!supabaseUrl || !supabaseAnonKey) {
-  console.error("Supabase URL and Key are missing. Please set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY.");
+if (!url || !anonKey) {
+  throw new Error('Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY in .env');
 }
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+/**
+ * persistSession: true -> ensures session is saved in localStorage so refresh keeps you signed-in.
+ * detectSessionInUrl: false -> avoids SPA sign-in URL handling issues.
+ */
+export const supabase = createClient(url, anonKey, {
   auth: {
     persistSession: true,
-    autoRefreshToken: true,
+    detectSessionInUrl: false,
   },
 });
